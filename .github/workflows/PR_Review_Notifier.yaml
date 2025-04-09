@@ -1,0 +1,97 @@
+name: Notify Slack on Pull Request
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  # pull_request_target:
+  #   types: [opened, reopened, ready_for_review, synchronize]
+
+jobs:
+  notify-slack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout main branch's team_leads.json
+        run: |
+          git fetch origin main
+          git checkout origin/main -- team_leads.json
+
+      - name: Extract PR Info
+        id: pr
+        run: |
+          echo "url=${{ github.event.pull_request.html_url }}" >> $GITHUB_OUTPUT
+          echo "author=${{ github.event.pull_request.user.login }}" >> $GITHUB_OUTPUT
+          echo "title=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+          echo "head=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+          echo "base=${{ github.event.pull_request.base.ref }}" >> $GITHUB_OUTPUT
+          echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+          echo "event=${{ github.event_name }}" >> $GITHUB_OUTPUT
+          echo "commit=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "short_commit=$(echo '${{ github.sha }}' | cut -c1-7)" >> $GITHUB_OUTPUT
+          echo "workflow_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
+
+      - name: Lookup Slack User IDs from team_leads.json
+        id: lead
+        env:
+          SLACK_BOT_PR_REVIEW_TOKEN: ${{ secrets.SLACK_BOT_PR_REVIEW_TOKEN }}
+        run: |
+          TEAM_LEAD_KEYS=("Team Lead 1" "Team Lead 2")
+          MENTIONS=""
+          if [ ! -f team_leads.json ]; then
+            echo "team_leads.json not found!"
+            exit 1
+          fi
+          for key in "${TEAM_LEAD_KEYS[@]}"; do
+            EMAIL=$(jq -r --arg k "$key" '.[$k]' team_leads.json)
+            if [ "$EMAIL" == "null" ] || [ -z "$EMAIL" ]; then
+              continue
+            fi
+            RESPONSE=$(curl -s -H "Authorization: Bearer $SLACK_BOT_PR_REVIEW_TOKEN" \
+              "https://slack.com/api/users.lookupByEmail?email=$EMAIL")
+            SLACK_ID=$(echo "$RESPONSE" | jq -r '.user.id // empty')
+            if [ -n "$SLACK_ID" ]; then
+              MENTIONS="$MENTIONS <@$SLACK_ID>"
+            fi
+          done
+          echo "lead_mentions=$MENTIONS" >> $GITHUB_OUTPUT
+
+      - name: Send Slack Notification via curl
+        env:
+          SLACK_BOT_PR_REVIEW_TOKEN: ${{ secrets.SLACK_BOT_PR_REVIEW_TOKEN }}
+        run: |
+          curl -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_PR_REVIEW_TOKEN" \
+            -H "Content-type: application/json" \
+            --data '{
+              "channel": "github-pr-review-notification",
+              "text": "🚨 New Pull Request Notification",
+              "blocks": [
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Event:*\n`${{ steps.pr.outputs.event }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Ref:*\n`${{ steps.pr.outputs.ref }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Commit:*\n<https://github.com/${{ github.repository }}/commit/${{ steps.pr.outputs.commit }}|`${{ steps.pr.outputs.short_commit }}`>"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rotating_light: *New PR* opened by `${{ steps.pr.outputs.author }}`:\n<${{ steps.pr.outputs.url }}|${{ steps.pr.outputs.title }}>\n\n:twisted_rightwards_arrows: *Branch:* `${{ steps.pr.outputs.head }}` → `${{ steps.pr.outputs.base }}`\n:bust_in_silhouette: *Team Lead(s):* \n${{ steps.lead.outputs.lead_mentions }}"
+                  }
+                }
+              ]
+            }'
